@@ -10,10 +10,13 @@ Name:                snaplet-recaptcha
 Version:             0.1
 
 -- A short (one-line) description of the package.
-Synopsis:            A ReCAPTCHA verification snaplet with connection sharing
+Synopsis:            A ReCAPTCHA verification snaplet with connection sharing.
 
 -- A longer description of the package.
--- Description:         
+Description:         This snaplet handles the interfacing with Google's ReCaptcha verification API.
+                     It uses `http-conduit` which manages a connection pool. On the one hand
+                     this avoid the overhead of reconnecting for every single captcha request and
+                     on the other hand limits the use of the server's resources.
 
 -- The license under which the package is released.
 License:             BSD3
@@ -41,7 +44,6 @@ Build-type:          Simple
 
 -- Constraint on the version of Cabal needed to build this package.
 Cabal-version:       >=1.10
-
 
 Library
   Hs-Source-Dirs:   src
@@ -77,3 +79,9 @@ Executable          recaptcha-test
                   , conduit
                   , http-conduit
                   , http-types
+
+Source-Repository   head
+  type:             git
+  location:         http://github.com/lpeterse/snaplet-recaptcha.git
+
+
