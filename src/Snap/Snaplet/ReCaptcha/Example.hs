@@ -25,9 +25,9 @@ import           Control.Lens
 import qualified Data.ByteString.Char8       as BS
 import           Data.Monoid
 import           Data.Text                   (Text)
-import qualified Data.Text.IO                as T
 
--- | Simple sample snaplet, built using 'ReCaptcha' in order to demonstrate how one might use it in the scenario of adding comments to a blog.
+-- | Simple sample snaplet, built using 'ReCaptcha' in order to demonstrate how
+-- one might use it in the scenario of adding comments to a blog.
 data Sample = Sample
   { _recaptcha :: !(Snaplet ReCaptcha)
   , _heist     :: !(Snaplet (Heist Sample))
@@ -48,13 +48,18 @@ instance HasReCaptcha Sample where
 instance HasHeist Sample where
   heistLens = subSnaplet heist
 
--- | A "blog" snaplet which reads hypothetical "posts" by their 'id', routing GET on \/posts\/:id to display a post, and POST on \/posts\/:id to add a comment to them. For loose, useless definitions of "post" and "comment" - this snaplet is only for demonstration purposes.
-initBlog :: forall b. (HasReCaptcha b, HasHeist b) => Snaplet (Heist b) -> SnapletInit b Blog
+-- | A "blog" snaplet which reads hypothetical "posts" by their 'id', routing
+-- GET on \/posts\/:id to display a post, and POST on \/posts\/:id to add a
+-- comment to them. For loose, useless definitions of "post" and "comment" -
+-- this snaplet is only for demonstration purposes.
+initBlog :: forall b. (HasReCaptcha b, HasHeist b) => Snaplet (Heist b)
+         -> SnapletInit b Blog
 initBlog heist = makeSnaplet "blog" "simple blog" Nothing $ do
   me <- getLens
 
   addRoutes
-    -- Hypothetical comments are just sent as POST to the respective post they are replying to
+    -- Hypothetical comments are just sent as POST to the respective post they
+    -- are replying to
     [("/posts/:id", method GET displayPost <|> method POST commentOnPost)]
 
   addConfig heist $ mempty &~ do
@@ -125,13 +130,14 @@ sampleTemplate =
  \  </body>\
  \</html>"
 
--- | Requires 'snaplets/heist/templates/sample.tpl' - a suggested version of which is available in this module as 'sampleTemplate'.
+-- | Requires 'snaplets/heist/templates/sample.tpl' - a suggested version of which
+-- is available in this module as 'sampleTemplate'.
 --
 -- This simple asks for your site and private key through stdin.
 initSample :: SnapletInit Sample Sample
 initSample = makeSnaplet "sample" "" Nothing $ do
   h <- nestSnaplet "heist"  heist     (heistInit "templates")
-  c <- nestSnaplet "submit" recaptcha (initReCaptcha h)
+  c <- nestSnaplet "submit" recaptcha (initReCaptcha (Just h))
   t <- nestSnaplet "blog"   blog      (initBlog h)
   return (Sample c h t)
 
