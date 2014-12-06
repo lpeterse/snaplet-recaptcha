@@ -15,9 +15,12 @@
 -- Stability   : experimental
 -- Portability : portable
 --
--- This is a snaplet for google's ReCaptcha verification api. This library uses `http-conduit` and keeps connections alive (a maximum of 10). This is an important point in order to avoid denial of service attacks.
+-- This is a snaplet for google's ReCaptcha verification api. This library uses
+-- `http-conduit` and keeps connections alive (a maximum of 10). This is an
+-- important point in order to avoid denial of service attacks.
 --
--- See 'Snap.Snaplet.ReCaptcha.Example' and the docs provided here for example usage.
+-- See 'Snap.Snaplet.ReCaptcha.Example' and the docs provided here for example
+-- usage.
 --
 
 module Snap.Snaplet.ReCaptcha
@@ -36,26 +39,22 @@ module Snap.Snaplet.ReCaptcha
   , SiteKey
     -- * Extra
   , cstate
+  , recaptchaScript, recaptchaDiv
   ) where
 
 import qualified Blaze.ByteString.Builder    as Blaze
 import           Control.Applicative
-import           Control.Exception           (Exception (..),
-                                              SomeException (..))
 import           Control.Lens
-import           Control.Monad.CatchIO       (catch, throw)
-import           Control.Monad.Except        (MonadError (throwError))
 import           Control.Monad.Reader        (runReaderT)
 
 import qualified Data.Aeson                  as JSON
 import qualified Data.Aeson.TH               as JSON
 import qualified Data.ByteString.Char8       as BS
-import qualified Data.ByteString.Lazy        as BSL
 import qualified Data.Configurator           as Conf
-import           Data.Text                   (Text, pack)
-import           Data.Text.Encoding          (decodeUtf8, encodeUtf8)
+import           Data.Text                   (Text)
+import           Data.Text.Encoding          (encodeUtf8)
 
-import           Data.Foldable               (fold, toList)
+import           Data.Foldable               (fold, for_, toList)
 import           Data.Monoid
 import           Data.Typeable
 
@@ -63,7 +62,6 @@ import           Heist
 import           Heist.Compiled
 
 import qualified Network.HTTP.Client.Conduit as HTTP
-import qualified Network.HTTP.Conduit        as HTTP (closeManager)
 
 import           Snap
 import           Snap.Snaplet.Heist.Compiled
@@ -76,9 +74,12 @@ type UserAnswer = BS.ByteString
 data Captcha
   = Success
   | Failure
-  -- | Errors returned by the Captcha. See <https://developers.google.com/recaptcha/docs/verify> for possible error codes. Note that 'Failure' is used for the case that the only error code returned is "invalid-input-response".
+  -- | Errors returned by the Captcha. See <https://developers.google.com/recaptcha/docs/verify>
+  -- for possible error codes. Note that 'Failure' is used for the case that the
+  -- only error code returned is "invalid-input-response".
   | Errors [Text]
-  -- | The server didn't respond with the JSON object required as per <https://developers.google.com/recaptcha/docs/verify>
+  -- | The server didn't respond with the JSON object required as per
+  -- <https://developers.google.com/recaptcha/docs/verify>
   | InvalidServerResponse
   -- | There was no "recaptcha_response_field" parameter set in the user request.
   | MissingResponseParam
@@ -112,12 +113,13 @@ JSON.deriveFromJSON JSON.defaultOptions
       _   -> c
   } ''ReCaptchaResponse
 
-initialiser :: Snaplet (Heist b) -> (SiteKey, PrivateKey) -> Initializer b v ReCaptcha
-initialiser heist (site,key) = do
+initialiser :: Maybe (Snaplet (Heist b)) -> (SiteKey, PrivateKey)
+            -> Initializer b v ReCaptcha
+initialiser mheist (site,key) = do
   -- this has to parse for the snaplet to work at all
   req <- liftIO (HTTP.parseUrl "https://www.google.com/recaptcha/api/siteverify")
   man <- liftIO HTTP.newManager
-  addReCaptchaHeist heist site
+  for_ mheist (\heist -> addReCaptchaHeist heist site)
   return ReCaptcha
     { connectionManager = man
     , recaptchaQuery    = \ip answer ->
@@ -129,8 +131,13 @@ initialiser heist (site,key) = do
     , _cstate = Failure
     }
 
--- | Initialise the 'ReCaptcha' snaplet. You are required to have "site_key" and "secret_key" set in the snaplet's configuration file. See 'initReCaptcha\'' if you don't want to use Snap's snaplet configuration mechanism.
-initReCaptcha :: Snaplet (Heist b) -> SnapletInit b ReCaptcha
+-- | Initialise the 'ReCaptcha' snaplet. You are required to have "site_key" and
+-- "secret_key" set in the snaplet's configuration file. See 'initReCaptcha\''
+-- if you don't want to use Snap's snaplet configuration mechanism.
+--
+-- This provides optional Heist support, which is implemented using
+-- 'recaptchaScript' and 'recaptchaDiv'.
+initReCaptcha :: Maybe (Snaplet (Heist b)) -> SnapletInit b ReCaptcha
 initReCaptcha heist =
   makeSnaplet "recaptcha" "ReCaptcha integration" Nothing $
     initialiser heist =<< do
@@ -143,40 +150,50 @@ initReCaptcha heist =
     case v of
       Just v' -> return v'
       Nothing -> do
-        path <- BS.pack `fmap` getSnapletFilePath
-        err  <- errorMsg ("Could not find key " <> encodeUtf8 field <> " in the config " <> path <> "/devel.cfg")
+        spath <- BS.pack `fmap` getSnapletFilePath
+        err   <- errorMsg (encodeUtf8 field <> " not in the config " <> spath
+                           <> "/devel.cfg")
         fail (BS.unpack err)
 
--- | Same as 'initReCaptcha', but passing the site key and private key explicitly.
-initReCaptcha' :: Snaplet (Heist b) -> (SiteKey, PrivateKey) -> SnapletInit b ReCaptcha
+-- | Same as 'initReCaptcha', but passing the site key and private key
+-- explicitly - no configuration on the filesystem is required.
+initReCaptcha' :: Maybe (Snaplet (Heist b)) -> (SiteKey, PrivateKey)
+               -> SnapletInit b ReCaptcha
 initReCaptcha' heist keys =
-  makeSnaplet "recaptcha" "ReCaptcha integration" Nothing (initialiser heist keys)
+  makeSnaplet "recaptcha" "ReCaptcha integration" Nothing
+    (initialiser heist keys)
 
 addReCaptchaHeist :: Snaplet (Heist b) -> BS.ByteString -> Initializer b v ()
 addReCaptchaHeist heist site = addConfig heist $ mempty &~ do
   scCompiledSplices .= do
-    "recaptcha-div"    ## pureSplice id (return div)
-    "recaptcha-script" ## pureSplice id (return script)
- where
-  script = Blaze.fromByteString
-    "<script src='https://www.google.com/recaptcha/api.js' async defer></script>"
-  div = Blaze.fromByteString $!
-    "<div class='g-recaptcha' data-sitekey='" <> site <> "'></div>"
+    "recaptcha-div"    ## pureSplice id (return (recaptchaDiv site))
+    "recaptcha-script" ## pureSplice id (return recaptchaScript)
+
+-- | @<script src='https://www.google.com/recaptcha/api.js' async defer></script> @
+recaptchaScript :: Blaze.Builder
+recaptchaScript = Blaze.fromByteString
+  "<script src='https://www.google.com/recaptcha/api.js' async defer></script>"
+
+-- | For use in a HTML form.
+recaptchaDiv :: BS.ByteString -> Blaze.Builder
+recaptchaDiv site = Blaze.fromByteString $!
+  "<div class='g-recaptcha' data-sitekey='" <> site <> "'></div>"
 
 -- | Get the ReCaptcha result by querying Google's API.
 --
--- This requires a "g-recaptcha-response" (POST) parameter to be set in the current request.
+-- This requires a "g-recaptcha-response" (POST) parameter to be set in the
+-- current request.
 --
 -- See 'ReCaptchaResult' for possible failure types.
 --
 -- @
--- do cstate <- getCaptcha
---    case cstate of
---      Success               -> writeText "Congratulations! You have won free gratification."
---      Failure               -> writeText "Incorrect cstate answer."
---      MissingResponseParam  -> writeText "No g-recaptcha-response POST parameter"
---      InvalidServerResponse -> writeText "Did Google change their API?"
---      Errors errs           -> writeText ("Errors: " <> 'T.pack' ('show' errs))
+-- cstate <- getCaptcha
+-- case cstate of
+--   Success               -> writeText "Congratulations! You won."
+--   Failure               -> writeText "Incorrect cstate answer."
+--   MissingResponseParam  -> writeText "No g-recaptcha-response in POST"
+--   InvalidServerResponse -> writeText "Did Google change their API?"
+--   Errors errs           -> writeText ("Errors: " <> 'T.pack' ('show' errs))
 -- @
 --
 -- This may throw a 'HTTP.HttpException' if there is a connection-related error.
@@ -228,7 +245,8 @@ withCaptcha onFail onSuccess = do
     Success -> onSuccess
     _       -> onFail
 
--- | 'pass' if the cstate failed. Logs errors (not incorrect captchas) with 'logError'.
+-- | 'pass' if the cstate failed. Logs errors (not incorrect captchas) with
+-- 'logError'.
 --
 -- @ 'checkCaptcha' '<|>' 'writeText' "Captcha failed!" @
 --
@@ -241,10 +259,11 @@ checkCaptcha = do
     Success   -> return ()
     Failure   -> pass
     someError -> do
-      pass
       logError =<< errorMsg (BS.pack (show someError))
+      pass
 
-errorMsg :: (MonadSnaplet m, Monad (m b v)) => BS.ByteString -> m b v BS.ByteString
+errorMsg :: (MonadSnaplet m, Monad (m b v)) => BS.ByteString
+         -> m b v BS.ByteString
 errorMsg err = do
   ancestry <- getSnapletAncestry
   name     <- getSnapletName
