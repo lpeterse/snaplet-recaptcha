@@ -1,138 +1,273 @@
-{-# LANGUAGE OverloadedStrings, FlexibleInstances, MultiParamTypeClasses, TemplateHaskell #-}
+{-# LANGUAGE DeriveDataTypeable        #-}
+{-# LANGUAGE FlexibleInstances         #-}
+{-# LANGUAGE MultiParamTypeClasses     #-}
+{-# LANGUAGE NoMonomorphismRestriction #-}
+{-# LANGUAGE OverloadedStrings         #-}
+{-# LANGUAGE TemplateHaskell           #-}
 -- |
 -- Module      : Snap.Snaplet.ReCaptcha
--- Copyright   : (c) Lars Petersen 2012
+-- Copyright   : (c) Mike Ledger 2014
+--               (c) Lars Petersen 2012
+--
 -- License     : BSD-style
 --
--- Maintainer  : info@lars-petersen.net
+-- Maintainer  : mike@quasimal.com, info@lars-petersen.net
 -- Stability   : experimental
 -- Portability : portable
--- 
--- This is a snaplet for google's ReCaptcha verification api. This library uses `http-conduit` and keeps connections alive (a maximum of 10 by now). This is an important point in order to avoid denial of service attacks.
--- 
--- Include it into your application like this:
 --
--- > import Snap.Snaplet.ReCaptcha
--- >
--- > data MyApplication = MyApplication { _recaptcha :: Snaplet ReCaptcha, ... }
--- >
--- > $(makeLenses [''MyApplication])
--- >
--- > instance HasReCaptcha MyApplicaiton where
--- >   recaptchaLens = subSnaplet recaptcha
--- >
--- > myApplication :: SnapletInit MyApplication
--- > myApplication
--- >   = makeSnaplet
--- >       "MyApplication"
--- >       ""
--- >        Nothing
--- >        $ do r <- embedSnaplet "recaptcha" recaptcha $ initReCaptcha "YOUR_PRIVATE_KEY"
--- >             return $ MyApplication { _recaptcha = r, ... }
+-- This is a snaplet for google's ReCaptcha verification api. This library uses
+-- `http-conduit` and keeps connections alive (a maximum of 10). This is an
+-- important point in order to avoid denial of service attacks.
 --
- 
-module Snap.Snaplet.ReCaptcha 
-       ( -- * Snaplet and Initialization
-         ReCaptcha ()
-       , HasReCaptcha (..)
-       , initReCaptcha
-         -- * Handlers
-       , verifyCaptcha
-         -- * Types
-       , PrivateKey
-       , ReCaptchaResult (..)
-       ) where
+-- See 'Snap.Snaplet.ReCaptcha.Example' and the docs provided here for example
+-- usage.
+--
 
-import Data.Lens.Common
-import Data.Lens.Template
+module Snap.Snaplet.ReCaptcha
+  ( -- * Snaplet and Initialization
+    ReCaptcha ()
+  , HasReCaptcha (..)
+  , initReCaptcha
+  , initReCaptcha'
+    -- * Handlers
+  , checkCaptcha
+  , withCaptcha
+  , getCaptcha
+    -- * Types
+  , Captcha(..)
+  , PrivateKey
+  , SiteKey
+    -- * Extra
+  , cstate
+  , recaptchaScript, recaptchaDiv
+  ) where
 
-import qualified Data.ByteString as BS
-import qualified Data.ByteString.Lazy as BSL
+import qualified Blaze.ByteString.Builder    as Blaze
+import           Control.Applicative
+import           Control.Lens
+import           Control.Monad.Reader        (runReaderT)
 
-import Data.Monoid
-import Control.Applicative
-import Control.Failure
-import Control.Exception (throw, try)
-import Control.Monad.Trans.Resource (runResourceT)
+import qualified Data.Aeson                  as JSON
+import qualified Data.Aeson.TH               as JSON
+import qualified Data.ByteString.Char8       as BS
+import qualified Data.Configurator           as Conf
+import           Data.Text                   (Text)
+import           Data.Text.Encoding          (encodeUtf8)
 
-import Network.HTTP.Types (renderSimpleQuery)
-import Network.HTTP.Conduit as HTTP
-import Snap
+import           Data.Foldable               (fold, for_, toList)
+import           Data.Monoid
+import           Data.Typeable
 
-data ReCaptcha
-  = ReCaptcha
-    { privateKey        :: PrivateKey
-    , connectionManager :: Manager 
-    }
+import           Heist
+import           Heist.Compiled
 
-class HasReCaptcha b where
-  recaptchaLens :: Lens (Snaplet b) (Snaplet ReCaptcha)
+import qualified Network.HTTP.Client.Conduit as HTTP
+
+import           Snap
+import           Snap.Snaplet.Heist.Compiled
 
 type PrivateKey = BS.ByteString
+type SiteKey    = BS.ByteString
+type UserIP     = BS.ByteString
+type UserAnswer = BS.ByteString
 
--- | The private key must be 40 characters long and encoded just like you get it from Google. 
-initReCaptcha :: PrivateKey -> SnapletInit b ReCaptcha
-initReCaptcha key
-  = makeSnaplet
-      "ReCaptcha"
-      ""
-      Nothing
-      $ do man <- liftIO (newManager def)
-           if BS.length key /= 40
-             then fail "ReCaptcha: private key must be exactly 40 chars long"
-             else return $ ReCaptcha key man
-
-data ReCaptchaResult
+data Captcha
   = Success
-  -- Taken from the official ReCaptcha Api documentation
-  | Failure BSL.ByteString
-  | ConnectionError HttpException
-  -- Misc
-  | MissingArguments
+  | Failure
+  -- | Errors returned by the Captcha. See <https://developers.google.com/recaptcha/docs/verify>
+  -- for possible error codes. Note that 'Failure' is used for the case that the
+  -- only error code returned is "invalid-input-response".
+  | Errors [Text]
+  -- | The server didn't respond with the JSON object required as per
+  -- <https://developers.google.com/recaptcha/docs/verify>
+  | InvalidServerResponse
+  -- | There was no "recaptcha_response_field" parameter set in the user request.
+  | MissingResponseParam
+ deriving (Show, Typeable)
 
-instance Failure HttpException (Handler b ReCaptcha) where
-  failure = throw
+data ReCaptcha = ReCaptcha
+  { connectionManager :: !HTTP.Manager
+  , recaptchaQuery    :: !(UserIP -> UserAnswer -> HTTP.Request)
+  , _cstate           :: !Captcha
+  } deriving (Typeable)
 
--- | You may use captcha verification troughout your whole application like this:
---
--- > myHandler :: (HasReCaptcha b) => Handler b SomeSubSnaplet ()
--- > myHandler
--- >   = do c <- verifyCaptcha
--- >        case c of
--- >          Success   -> .. -- captcha successfully solved
--- >          _         -> .. -- something went wrong
---
--- You don't need to extract the challenge and response paramters from the request. This is all handled by the snaplet. Just make sure the parameters `recaptcha_challenge_field` and `recaptcha_response_field` are contained in the user's request. Otherwise the `verifyCaptcha` call will return `MissingArguments`.
---
-verifyCaptcha :: (HasReCaptcha b) => Handler b c ReCaptchaResult 
-verifyCaptcha
-  = do mchallenge <- getParam "recaptcha_challenge_field"
-       mresponse  <- getParam "recaptcha_response_field"
-       case (mchallenge, mresponse) of
-         (Just challenge, Just response)
-           -> do man         <- withTop' recaptchaLens (gets connectionManager)
-                 privatekey  <- withTop' recaptchaLens (gets privateKey)
-                 rq          <- withTop' recaptchaLens (parseUrl "http://www.google.com/recaptcha/api/verify")
-                 remoteip    <- rqRemoteAddr <$> getRequest
-                 let request = rq
-                               { HTTP.method = "POST"
-                               , queryString = renderSimpleQuery False
-                                                 [ ("privatekey", privatekey)
-                                                 , ("remoteip",   remoteip)
-                                                 , ("challenge",  challenge)
-                                                 , ("response",   response)
-                                                 ]
-                               }
-                 result <- liftIO $ Control.Exception.try $ runResourceT $ httpLbs request man
-                 case result of
-                   Left e   -> do return (ConnectionError (e :: HttpException))
-                   Right r  -> do let ls = BSL.split 0x0a $ responseBody r
-                                  let ua = return (Failure $ responseBody r)
-                                  if length ls < 2
-                                    then ua
-                                    else case ls !! 0 of
-                                           "true"  -> return $ Success
-                                           "false" -> return $ Failure (ls !! 1) 
-                                           _       -> ua
-         _ -> return MissingArguments
+makeLenses ''ReCaptcha
 
+class HasReCaptcha b where
+  captchaLens :: SnapletLens (Snaplet b) ReCaptcha
+
+instance HasReCaptcha ReCaptcha where
+  captchaLens = id
+
+-- This is kinda lame - should we just parse it manually?
+data ReCaptchaResponse = ReCaptchaResponse
+  { success     :: !Bool
+  , error_codes :: !(Maybe [Text])
+  }
+
+JSON.deriveJSON JSON.defaultOptions ''Captcha
+
+JSON.deriveFromJSON JSON.defaultOptions
+  { JSON.fieldLabelModifier = map $ \c -> case c of
+      '_' -> '-'
+      _   -> c
+  } ''ReCaptchaResponse
+
+initialiser :: Maybe (Snaplet (Heist b)) -> (SiteKey, PrivateKey)
+            -> Initializer b v ReCaptcha
+initialiser mheist (site,key) = do
+  -- this has to parse for the snaplet to work at all
+  req <- liftIO (HTTP.parseUrl "https://www.google.com/recaptcha/api/siteverify")
+  man <- liftIO HTTP.newManager
+  for_ mheist (\heist -> addReCaptchaHeist heist site)
+  return ReCaptcha
+    { connectionManager = man
+    , recaptchaQuery    = \ip answer ->
+        HTTP.urlEncodedBody
+          [ ("secret"   , key)
+          , ("response" , answer)
+          , ("remoteip" , ip) ]
+          req
+    , _cstate = Failure
+    }
+
+-- | Initialise the 'ReCaptcha' snaplet. You are required to have "site_key" and
+-- "secret_key" set in the snaplet's configuration file. See 'initReCaptcha\''
+-- if you don't want to use Snap's snaplet configuration mechanism.
+--
+-- This provides optional Heist support, which is implemented using
+-- 'recaptchaScript' and 'recaptchaDiv'.
+initReCaptcha :: Maybe (Snaplet (Heist b)) -> SnapletInit b ReCaptcha
+initReCaptcha heist =
+  makeSnaplet "recaptcha" "ReCaptcha integration" Nothing $
+    initialiser heist =<< do
+      conf <- getSnapletUserConfig
+      (,) <$> require conf "site_key"
+          <*> require conf "secret_key"
+ where
+  require conf field = do
+    v <- liftIO (Conf.lookup conf field)
+    case v of
+      Just v' -> return v'
+      Nothing -> do
+        spath <- BS.pack `fmap` getSnapletFilePath
+        err   <- errorMsg (encodeUtf8 field <> " not in the config " <> spath
+                           <> "/devel.cfg")
+        fail (BS.unpack err)
+
+-- | Same as 'initReCaptcha', but passing the site key and private key
+-- explicitly - no configuration on the filesystem is required.
+initReCaptcha' :: Maybe (Snaplet (Heist b)) -> (SiteKey, PrivateKey)
+               -> SnapletInit b ReCaptcha
+initReCaptcha' heist keys =
+  makeSnaplet "recaptcha" "ReCaptcha integration" Nothing
+    (initialiser heist keys)
+
+addReCaptchaHeist :: Snaplet (Heist b) -> BS.ByteString -> Initializer b v ()
+addReCaptchaHeist heist site = addConfig heist $ mempty &~ do
+  scCompiledSplices .= do
+    "recaptcha-div"    ## pureSplice id (return (recaptchaDiv site))
+    "recaptcha-script" ## pureSplice id (return recaptchaScript)
+
+-- | @<script src='https://www.google.com/recaptcha/api.js' async defer></script> @
+recaptchaScript :: Blaze.Builder
+recaptchaScript = Blaze.fromByteString
+  "<script src='https://www.google.com/recaptcha/api.js' async defer></script>"
+
+-- | For use in a HTML form.
+recaptchaDiv :: BS.ByteString -> Blaze.Builder
+recaptchaDiv site = Blaze.fromByteString $!
+  "<div class='g-recaptcha' data-sitekey='" <> site <> "'></div>"
+
+-- | Get the ReCaptcha result by querying Google's API.
+--
+-- This requires a "g-recaptcha-response" (POST) parameter to be set in the
+-- current request.
+--
+-- See 'ReCaptchaResult' for possible failure types.
+--
+-- @
+-- cstate <- getCaptcha
+-- case cstate of
+--   Success               -> writeText "Congratulations! You won."
+--   Failure               -> writeText "Incorrect cstate answer."
+--   MissingResponseParam  -> writeText "No g-recaptcha-response in POST"
+--   InvalidServerResponse -> writeText "Did Google change their API?"
+--   Errors errs           -> writeText ("Errors: " <> 'T.pack' ('show' errs))
+-- @
+--
+-- This may throw a 'HTTP.HttpException' if there is a connection-related error.
+getCaptcha :: HasReCaptcha b => Handler b c Captcha
+getCaptcha = do
+  mresponse <- getPostParam "g-recaptcha-response"
+  case mresponse of
+    Just answer -> withTop' captchaLens $ do
+      manager  <- gets connectionManager
+      getQuery <- gets recaptchaQuery
+      remoteip <- getsRequest rqRemoteAddr
+      response <- runReaderT (HTTP.httpLbs (getQuery remoteip answer)) manager
+      -- The reply is a JSON object looking like
+      -- {
+      --   "success": true|false,
+      --   "error-codes": [...]   // optional
+      -- }
+      -- see <https://developers.google.com/recaptcha/docs/verify>
+      -- we just use aeson and the derived FromJSON instance here
+      return $! case JSON.decode (HTTP.responseBody response) of
+        Just obj
+          | success      obj -> Success
+          | invalidInput obj -> Failure
+          | otherwise        -> Errors (fold (error_codes obj))
+        Nothing -> InvalidServerResponse
+    Nothing -> return MissingResponseParam
+ where
+  invalidInput obj = error_codes obj == Just ["invalid-input-response"]
+
+-- | Run one of two handlers on either failing or succeeding a captcha.
+--
+-- @
+-- 'withCaptcha' banForever $ do
+--   postId <- 'getParam' "id"
+--   thing  <- 'getPostParam' thing
+--   addCommentToDB postId thing
+-- @
+--
+-- See 'getCaptcha'
+withCaptcha
+  :: HasReCaptcha b
+  => Handler b c () -- ^ Ran on failure
+  -> Handler b c () -- ^ Ran on success
+  -> Handler b c ()
+withCaptcha onFail onSuccess = do
+  s <- getCaptcha
+  withTop' captchaLens (cstate .= s)
+  case s of
+    Success -> onSuccess
+    _       -> onFail
+
+-- | 'pass' if the cstate failed. Logs errors (not incorrect captchas) with
+-- 'logError'.
+--
+-- @ 'checkCaptcha' '<|>' 'writeText' "Captcha failed!" @
+--
+-- See 'getCaptcha'
+checkCaptcha :: HasReCaptcha b => Handler b c ()
+checkCaptcha = do
+  s <- getCaptcha
+  withTop' captchaLens (cstate .= s)
+  case s of
+    Success   -> return ()
+    Failure   -> pass
+    someError -> do
+      logError =<< errorMsg (BS.pack (show someError))
+      pass
+
+errorMsg :: (MonadSnaplet m, Monad (m b v)) => BS.ByteString
+         -> m b v BS.ByteString
+errorMsg err = do
+  ancestry <- getSnapletAncestry
+  name     <- getSnapletName
+  return $! showTextList (ancestry++toList name) <> " (ReCaptcha) : " <> err
+ where
+  showTextList :: [Text] -> BS.ByteString
+  showTextList = BS.intercalate "/" . map encodeUtf8
