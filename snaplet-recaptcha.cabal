@@ -20,7 +20,7 @@ library
   exposed-modules:     Snap.Snaplet.ReCaptcha
                      , Snap.Snaplet.ReCaptcha.Example
 
-  build-depends:       base
+  build-depends:       base < 5
                      , lens
                      , heist >= 0.14 && <0.15
                      , snap >= 0.13 && <0.14
